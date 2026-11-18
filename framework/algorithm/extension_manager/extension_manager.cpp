@@ -25,12 +25,42 @@
 namespace {
     using LibFunctionGetRegisters = std::unordered_map<std::string,
         OHOS::Media::VideoProcessingEngine::Extension::RegisterExtensionFunc>* (*)();
-    LibFunctionGetRegisters GetRegisterExtensionFuncs{nullptr};
-    LibFunctionGetRegisters GetRegisterMetdataGenExtensionFuncs{nullptr};
-    LibFunctionGetRegisters GetRegisterComposeExtensionFuncs{nullptr};
-    LibFunctionGetRegisters GetRegisterDecomposeExtensionFuncs{nullptr};
     using LibFunctionGetRegisterFunction = OHOS::Media::VideoProcessingEngine::Extension::RegisterExtensionFunc (*)();
-    LibFunctionGetRegisterFunction GetRegisterVRRExtensionFuncs{nullptr};
+
+    class DynamicLibraryLease {
+    public:
+        DynamicLibraryLease()
+        {
+            OHOS::Media::VideoProcessingEngine::Extension::ExtensionManager::GetInstance().IncreaseInstance();
+        }
+        ~DynamicLibraryLease()
+        {
+            OHOS::Media::VideoProcessingEngine::Extension::ExtensionManager::GetInstance().DecreaseInstance();
+        }
+        DynamicLibraryLease(const DynamicLibraryLease&) = delete;
+        DynamicLibraryLease& operator=(const DynamicLibraryLease&) = delete;
+    };
+
+    template<typename T>
+    struct LeasedExtensionImpl {
+        // Members are destroyed in reverse declaration order: impl must be destroyed before lease.
+        std::shared_ptr<DynamicLibraryLease> lease;
+        std::shared_ptr<T> impl;
+    };
+
+    template<typename T>
+    std::shared_ptr<T> AttachDynamicLibraryLease(std::shared_ptr<T> impl,
+        const std::shared_ptr<DynamicLibraryLease>& lease)
+    {
+        if (impl == nullptr) {
+            return nullptr;
+        }
+        auto holder = std::make_shared<LeasedExtensionImpl<T>>();
+        holder->lease = lease;
+        holder->impl = std::move(impl);
+        return std::shared_ptr<T>(holder, holder->impl.get());
+    }
+
     void* g_algoHandle{nullptr};
 } // namespace
 
@@ -47,6 +77,7 @@ ExtensionManager& ExtensionManager::GetInstance()
 
 ExtensionManager::ExtensionManager()
 {
+    std::lock_guard<std::mutex> lock(instanceCountMtx_);
     (void)Init();
     g_algoHandle = dlopen("libvideoprocessingengine_ext.z.so", RTLD_NOW);
     if (g_algoHandle == nullptr) {
@@ -56,6 +87,7 @@ ExtensionManager::ExtensionManager()
 
 ExtensionManager::~ExtensionManager()
 {
+    std::lock_guard<std::mutex> lock(instanceCountMtx_);
     if (g_algoHandle != nullptr) {
         dlclose(g_algoHandle);
         g_algoHandle = nullptr;
@@ -83,6 +115,10 @@ void ExtensionManager::IncreaseInstance()
 void ExtensionManager::DecreaseInstance()
 {
     std::lock_guard<std::mutex> lock(instanceCountMtx_);
+    if (usedInstance_ <= 0) {
+        VPE_LOGE("Unbalanced DecreaseInstance call");
+        return;
+    }
     usedInstance_--;
     if ((usedInstance_ == 0) && (g_algoHandle != nullptr)) {
         dlclose(g_algoHandle);
@@ -92,6 +128,7 @@ void ExtensionManager::DecreaseInstance()
 
 bool ExtensionManager::IsColorSpaceConversionSupported(const FrameInfo &inputInfo, const FrameInfo &outputInfo) const
 {
+    auto dynamicLibraryLease = std::make_shared<DynamicLibraryLease>();
     if (!initialized_) {
         return false;
     }
@@ -102,63 +139,77 @@ std::shared_ptr<ColorSpaceConverterBase> ExtensionManager::CreateColorSpaceConve
     const FrameInfo &outputInfo, Extension::ExtensionInfo &extensionInfo) const
 {
     CHECK_AND_RETURN_RET_LOG(initialized_ == true, nullptr, "Not initialized");
+    auto dynamicLibraryLease = std::make_shared<DynamicLibraryLease>();
     auto extension = FindColorSpaceConverterExtension(inputInfo, outputInfo);
     CHECK_AND_RETURN_RET_LOG(extension != nullptr, nullptr, "Create extension failed, get an empty extension");
     auto impl = extension->creator();
     CHECK_AND_RETURN_RET_LOG(impl != nullptr, nullptr,
         "Call extension creator failed, return a empty impl, extension: %{public}s", extension->info.name.c_str());
     extensionInfo = extension->info;
-    return impl;
+    return AttachDynamicLibraryLease(std::move(impl), dynamicLibraryLease);
 }
 
 std::shared_ptr<DetailEnhancerBase> ExtensionManager::CreateAutoEffectAisr() const
 {
     VPE_LOGI("ExtensionManager::CreateAutoEffectAisr start");
     CHECK_AND_RETURN_RET_LOG(initialized_ == true, nullptr, "CreateAutoEffectAisr: Not initialized");
+    auto dynamicLibraryLease = std::make_shared<DynamicLibraryLease>();
     auto extension = FindAutoEffectAisrExtension();
     CHECK_AND_RETURN_RET_LOG(extension != nullptr, nullptr, "CreateAutoEffectAisr: get an empty extension");
     // Use dlsym to get creator from ext .so directly, avoiding CFI cross-DSO failure
     // caused by static_pointer_cast<AutoEffectAisrExtension> and subsequent indirect calls
     using AutoEffectAisrCreator = void*(*)();
-    auto creator = reinterpret_cast<AutoEffectAisrCreator>(dlsym(g_algoHandle, "CreateAutoEffectAisrVideo"));
+    AutoEffectAisrCreator creator = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(instanceCountMtx_);
+        CHECK_AND_RETURN_RET_LOG(g_algoHandle != nullptr, nullptr, "CreateAutoEffectAisr: dlopen ext fail");
+        creator = reinterpret_cast<AutoEffectAisrCreator>(dlsym(g_algoHandle, "CreateAutoEffectAisrVideo"));
+    }
     CHECK_AND_RETURN_RET_LOG(creator != nullptr, nullptr,
         "CreateAutoEffectAisr: dlsym CreateAutoEffectAisrVideo failed: %{public}s", dlerror());
     void* rawImpl = creator();
     CHECK_AND_RETURN_RET_LOG(rawImpl != nullptr, nullptr,
         "CreateAutoEffectAisr: CreateAutoEffectAisrVideo returned null");
     VPE_LOGI("ExtensionManager::CreateAutoEffectAisr success");
-    return std::shared_ptr<DetailEnhancerBase>(
+    auto impl = std::shared_ptr<DetailEnhancerBase>(
         static_cast<DetailEnhancerBase*>(rawImpl),
         [](DetailEnhancerBase* p) { delete p; });
+    return AttachDynamicLibraryLease(std::move(impl), dynamicLibraryLease);
 }
 
 std::shared_ptr<VideoRefreshRatePredictionBase> ExtensionManager::CreateVideoRefreshRatePredictor() const
 {
+    auto dynamicLibraryLease = std::make_shared<DynamicLibraryLease>();
+    LibFunctionGetRegisterFunction getRegisterVRRExtensionFuncs = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(instanceCountMtx_);
+        CHECK_AND_RETURN_RET_LOG(g_algoHandle != nullptr, {}, "dlopen ext fail!");
+        getRegisterVRRExtensionFuncs = reinterpret_cast<LibFunctionGetRegisterFunction>
+            (dlsym(g_algoHandle, "GetRegisterVRRExtensionFuncs"));
+    }
+    CHECK_AND_RETURN_RET_LOG(getRegisterVRRExtensionFuncs != nullptr, {}, "dlsym Get VRR Extension fail!");
+
     std::shared_ptr<ExtensionBase> extension;
-    CHECK_AND_RETURN_RET_LOG(g_algoHandle != nullptr, {}, "dlopen ext fail!");
-    GetRegisterVRRExtensionFuncs = reinterpret_cast<LibFunctionGetRegisterFunction>
-        (dlsym(g_algoHandle, "GetRegisterVRRExtensionFuncs"));
-    CHECK_AND_RETURN_RET_LOG(GetRegisterVRRExtensionFuncs != nullptr, {}, "dlsym Get VRR Extension fail!");
-    
-    auto registerFunctionPtr = GetRegisterVRRExtensionFuncs();
+    auto registerFunctionPtr = getRegisterVRRExtensionFuncs();
     CHECK_AND_RETURN_RET_LOG(registerFunctionPtr != nullptr, {}, "get GetRegisterVRRExtensionFuncs fail!!");
     registerFunctionPtr(reinterpret_cast<uintptr_t>(&extension));
     std::shared_ptr<VideoRefreshratePredictionExtension> vrrExtension =
             std::static_pointer_cast<VideoRefreshratePredictionExtension>(extension);
     auto impl = vrrExtension->creator();
-    return impl;
+    return AttachDynamicLibraryLease(std::move(impl), dynamicLibraryLease);
 }
 
 ColorSpaceConverterDisplaySet ExtensionManager::CreateColorSpaceConverterDisplay() const
 {
     CHECK_AND_RETURN_RET_LOG(initialized_ == true, {}, "Not initialized");
 
+    auto dynamicLibraryLease = std::make_shared<DynamicLibraryLease>();
     ColorSpaceConverterDisplaySet impl;
     for (const auto &extension : FindColorSpaceConverterDisplayExtension()) {
         auto temp = extension->creator();
         CHECK_AND_RETURN_RET_LOG(temp != nullptr, {}, "Create failed, extension: %{public}s",
             extension->info.name.c_str());
-        impl.emplace(std::move(temp));
+        impl.emplace(AttachDynamicLibraryLease(std::move(temp), dynamicLibraryLease));
     }
     return impl;
 }
@@ -167,26 +218,28 @@ std::shared_ptr<MetadataGeneratorBase> ExtensionManager::CreateMetadataGenerator
     Extension::ExtensionInfo &extensionInfo, MetadataGeneratorAlgoType algoType) const
 {
     CHECK_AND_RETURN_RET_LOG(initialized_ == true, nullptr, "Not initialized");
+    auto dynamicLibraryLease = std::make_shared<DynamicLibraryLease>();
     auto extension = FindMetadataGeneratorExtension(inputInfo, algoType);
     CHECK_AND_RETURN_RET_LOG(extension != nullptr, nullptr, "Create failed, get an empty extension");
     auto impl = extension->creator();
     CHECK_AND_RETURN_RET_LOG(impl != nullptr, nullptr,
         "Call extension creator failed, return a empty impl, extension: %{public}s", extension->info.name.c_str());
     extensionInfo = extension->info;
-    return impl;
+    return AttachDynamicLibraryLease(std::move(impl), dynamicLibraryLease);
 }
 
 std::shared_ptr<AihdrEnhancerBase> ExtensionManager::CreateAihdrEnhancer(const FrameInfo &inputInfo,
     Extension::ExtensionInfo &extensionInfo) const
 {
     CHECK_AND_RETURN_RET_LOG(initialized_ == true, nullptr, "Not initialized");
+    auto dynamicLibraryLease = std::make_shared<DynamicLibraryLease>();
     auto extension = FindAihdrEnhancerExtension(inputInfo);
     CHECK_AND_RETURN_RET_LOG(extension != nullptr, nullptr, "Create failed, get an empty extension");
     auto impl = extension->creator();
     CHECK_AND_RETURN_RET_LOG(impl != nullptr, nullptr,
         "Call extension creator failed, return a empty impl, extension: %{public}s", extension->info.name.c_str());
     extensionInfo = extension->info;
-    return impl;
+    return AttachDynamicLibraryLease(std::move(impl), dynamicLibraryLease);
 }
 
 int32_t ExtensionManager::NewInstanceId(const ExtensionManager::InstanceVariableType& instance)
@@ -209,11 +262,17 @@ int32_t ExtensionManager::NewInstanceId(const ExtensionManager::InstanceVariable
 
 int32_t ExtensionManager::RemoveInstanceReference(int32_t& id)
 {
-    std::lock_guard<std::mutex> lock(instanceManagementMtx_);
-    CHECK_AND_RETURN_RET_LOG(id >= 0 && id < MAX_INSTANCE_NUM, VPE_ALGO_ERR_INVALID_VAL, "invalid instance id");
-    instanceList_[id].reset() ;
-    id = -1;
+    std::optional<InstanceVariableType> removedInstance;
+    {
+        std::lock_guard<std::mutex> lock(instanceManagementMtx_);
+        CHECK_AND_RETURN_RET_LOG(id >= 0 && id < MAX_INSTANCE_NUM, VPE_ALGO_ERR_INVALID_VAL, "invalid instance id");
+        removedInstance = std::move(instanceList_[id]);
+        instanceList_[id].reset();
+        id = -1;
+    }
 
+    // The removed instance and its dynamic library lease are destroyed after unlocking.
+    removedInstance.reset();
     return VPE_ALGO_ERR_OK;
 }
 
@@ -227,6 +286,7 @@ std::optional<ExtensionManager::InstanceVariableType> ExtensionManager::GetInsta
 std::shared_ptr<DetailEnhancerBase> ExtensionManager::CreateDetailEnhancer(uint32_t level) const
 {
     CHECK_AND_RETURN_RET_LOG(initialized_ == true, nullptr, "Not initialized");
+    auto dynamicLibraryLease = std::make_shared<DynamicLibraryLease>();
     auto extension = FindDetailEnhancerExtension(level);
     CHECK_AND_RETURN_RET_LOG(extension != nullptr, nullptr,
         "Create failed, get an empty extension. level: %{public}d", level);
@@ -234,12 +294,13 @@ std::shared_ptr<DetailEnhancerBase> ExtensionManager::CreateDetailEnhancer(uint3
     CHECK_AND_RETURN_RET_LOG(impl != nullptr, nullptr,
         "Call extension creator failed, return a empty impl, extension: %{public}s, level: %{public}d",
         extension->info.name.c_str(), level);
-    return impl;
+    return AttachDynamicLibraryLease(std::move(impl), dynamicLibraryLease);
 }
 
 std::shared_ptr<ContrastEnhancerBase> ExtensionManager::CreateContrastEnhancer(ContrastEnhancerType type) const
 {
     CHECK_AND_RETURN_RET_LOG(initialized_ == true, nullptr, "Not initialized");
+    auto dynamicLibraryLease = std::make_shared<DynamicLibraryLease>();
     auto extension = FindContrastEnhancerExtension(type);
     CHECK_AND_RETURN_RET_LOG(extension != nullptr, nullptr,
         "Create failed, get an empty extension. type: %{public}d", type);
@@ -247,7 +308,7 @@ std::shared_ptr<ContrastEnhancerBase> ExtensionManager::CreateContrastEnhancer(C
     CHECK_AND_RETURN_RET_LOG(impl != nullptr, nullptr,
         "Call extension creator failed, return a empty impl, extension: %{public}s, type: %{public}d",
         extension->info.name.c_str(), type);
-    return impl;
+    return AttachDynamicLibraryLease(std::move(impl), dynamicLibraryLease);
 }
 
 ExtensionList ExtensionManager::LoadExtensions() const
@@ -275,6 +336,7 @@ ExtensionList ExtensionManager::LoadStaticImageExtensions(
 bool ExtensionManager::FindImageConverterExtension(
     const FrameInfo &inputInfo, const FrameInfo &outputInfo) const
 {
+    auto dynamicLibraryLease = std::make_shared<DynamicLibraryLease>();
     auto extensionList = LoadExtensions();
     CHECK_AND_RETURN_RET_LOG(!extensionList.empty(), false, "No extension found");
     auto colorSpaceConverterCapabilityMap = BuildCaps<ColorSpaceConverterCapabilityMap>(extensionList);
@@ -292,6 +354,7 @@ bool ExtensionManager::FindImageConverterExtension(
 bool ExtensionManager::FindImageComposeExtension(
     const FrameInfo &inputInfo, const FrameInfo &outputInfo) const
 {
+    auto dynamicLibraryLease = std::make_shared<DynamicLibraryLease>();
     auto extensionList = LoadDynamicComposeExtensions();
     CHECK_AND_RETURN_RET_LOG(!extensionList.empty(), false, "No extension found");
     auto colorSpaceConverterCapabilityMap = BuildCaps<ColorSpaceConverterCapabilityMap>(extensionList);
@@ -309,6 +372,7 @@ bool ExtensionManager::FindImageComposeExtension(
 bool ExtensionManager::FindImageDecomposeExtension(
     const FrameInfo &inputInfo, const FrameInfo &outputInfo) const
 {
+    auto dynamicLibraryLease = std::make_shared<DynamicLibraryLease>();
     auto extensionList = LoadDynamicDecomposeExtensions();
     CHECK_AND_RETURN_RET_LOG(!extensionList.empty(), false, "No extension found");
     auto colorSpaceConverterCapabilityMap = BuildCaps<ColorSpaceConverterCapabilityMap>(extensionList);
@@ -325,6 +389,7 @@ bool ExtensionManager::FindImageDecomposeExtension(
 
 bool ExtensionManager::FindImageMetadataGenExtension(const FrameInfo &inputInfo) const
 {
+    auto dynamicLibraryLease = std::make_shared<DynamicLibraryLease>();
     auto extensionList = LoadDynamicMetadataGenExtensions();
     CHECK_AND_RETURN_RET_LOG(!extensionList.empty(), false, "No extension found");
     auto metadataGeneratorCapabilityMap = BuildCaps<MetadataGeneratorCapabilityMap>(extensionList);
@@ -408,11 +473,15 @@ VPEAlgoErrCode ExtensionManager::LoadStaticExtensions(ExtensionList& extensionLi
 
 void ExtensionManager::LoadDynamicExtensions(ExtensionList& extensionList) const
 {
-    CHECK_AND_RETURN_LOG(g_algoHandle != nullptr, "dlopen ext fail!");
-    GetRegisterExtensionFuncs = reinterpret_cast<LibFunctionGetRegisters>
-        (dlsym(g_algoHandle, "GetRegisterExtensionFuncs"));
-    CHECK_AND_RETURN_LOG(GetRegisterExtensionFuncs != nullptr, "dlsym GetRegisterExtensionFuncs fail!");
-    auto dynamicExtensionsRegisterMapPtr = GetRegisterExtensionFuncs();
+    LibFunctionGetRegisters getRegisterExtensionFuncs = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(instanceCountMtx_);
+        CHECK_AND_RETURN_LOG(g_algoHandle != nullptr, "dlopen ext fail!");
+        getRegisterExtensionFuncs = reinterpret_cast<LibFunctionGetRegisters>
+            (dlsym(g_algoHandle, "GetRegisterExtensionFuncs"));
+    }
+    CHECK_AND_RETURN_LOG(getRegisterExtensionFuncs != nullptr, "dlsym GetRegisterExtensionFuncs fail!");
+    auto dynamicExtensionsRegisterMapPtr = getRegisterExtensionFuncs();
     CHECK_AND_RETURN_LOG(dynamicExtensionsRegisterMapPtr != nullptr, "get dynamicExtensionsRegisterMap fail!!");
     auto dynamicExtensionsRegisterMap = *dynamicExtensionsRegisterMapPtr;
     for (auto &reg : dynamicExtensionsRegisterMap) {
@@ -426,14 +495,17 @@ void ExtensionManager::LoadDynamicExtensions(ExtensionList& extensionList) const
 ExtensionList ExtensionManager::LoadDynamicMetadataGenExtensions() const
 {
     ExtensionList extensionList {};
-    CHECK_AND_RETURN_RET_LOG(g_algoHandle != nullptr, {}, "dlopen ext fail!");
-
-    GetRegisterMetdataGenExtensionFuncs = reinterpret_cast<LibFunctionGetRegisters>
-        (dlsym(g_algoHandle, "GetRegisterMetdataGenExtensionFuncs"));
-    CHECK_AND_RETURN_RET_LOG(GetRegisterMetdataGenExtensionFuncs != nullptr, {},
+    LibFunctionGetRegisters getRegisterMetdataGenExtensionFuncs = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(instanceCountMtx_);
+        CHECK_AND_RETURN_RET_LOG(g_algoHandle != nullptr, {}, "dlopen ext fail!");
+        getRegisterMetdataGenExtensionFuncs = reinterpret_cast<LibFunctionGetRegisters>
+            (dlsym(g_algoHandle, "GetRegisterMetdataGenExtensionFuncs"));
+    }
+    CHECK_AND_RETURN_RET_LOG(getRegisterMetdataGenExtensionFuncs != nullptr, {},
         "dlsym GetRegisterMetdataGenExtensionFuncs fail!");
 
-    auto dynamicExtensionsRegisterMapPtr = GetRegisterMetdataGenExtensionFuncs();
+    auto dynamicExtensionsRegisterMapPtr = getRegisterMetdataGenExtensionFuncs();
     CHECK_AND_RETURN_RET_LOG(dynamicExtensionsRegisterMapPtr != nullptr, {},
         "get dynamicMetadataGenExtensions fail!!");
     auto dynamicExtensionsRegisterMap = *dynamicExtensionsRegisterMapPtr;
@@ -449,14 +521,17 @@ ExtensionList ExtensionManager::LoadDynamicMetadataGenExtensions() const
 ExtensionList ExtensionManager::LoadDynamicComposeExtensions() const
 {
     ExtensionList extensionList {};
-    CHECK_AND_RETURN_RET_LOG(g_algoHandle != nullptr, {}, "dlopen ext fail!");
-
-    GetRegisterComposeExtensionFuncs = reinterpret_cast<LibFunctionGetRegisters>
-        (dlsym(g_algoHandle, "GetRegisterComposeExtensionFuncs"));
-    CHECK_AND_RETURN_RET_LOG(GetRegisterComposeExtensionFuncs != nullptr, {},
+    LibFunctionGetRegisters getRegisterComposeExtensionFuncs = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(instanceCountMtx_);
+        CHECK_AND_RETURN_RET_LOG(g_algoHandle != nullptr, {}, "dlopen ext fail!");
+        getRegisterComposeExtensionFuncs = reinterpret_cast<LibFunctionGetRegisters>
+            (dlsym(g_algoHandle, "GetRegisterComposeExtensionFuncs"));
+    }
+    CHECK_AND_RETURN_RET_LOG(getRegisterComposeExtensionFuncs != nullptr, {},
         "dlsym GetRegisterComposeExtensionFuncs fail!");
 
-    auto dynamicExtensionsRegisterMapPtr = GetRegisterComposeExtensionFuncs();
+    auto dynamicExtensionsRegisterMapPtr = getRegisterComposeExtensionFuncs();
     CHECK_AND_RETURN_RET_LOG(dynamicExtensionsRegisterMapPtr != nullptr, {},
         "get dynamicMetadataGenExtensions fail!!");
     auto dynamicExtensionsRegisterMap = *dynamicExtensionsRegisterMapPtr;
@@ -472,14 +547,17 @@ ExtensionList ExtensionManager::LoadDynamicComposeExtensions() const
 ExtensionList ExtensionManager::LoadDynamicDecomposeExtensions() const
 {
     ExtensionList extensionList {};
-    CHECK_AND_RETURN_RET_LOG(g_algoHandle != nullptr, {}, "dlopen ext fail, g_algoHandle null!");
-
-    GetRegisterDecomposeExtensionFuncs = reinterpret_cast<LibFunctionGetRegisters>
-        (dlsym(g_algoHandle, "GetRegisterDecomposeExtensionFuncs"));
-    CHECK_AND_RETURN_RET_LOG(GetRegisterDecomposeExtensionFuncs != nullptr, {},
+    LibFunctionGetRegisters getRegisterDecomposeExtensionFuncs = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(instanceCountMtx_);
+        CHECK_AND_RETURN_RET_LOG(g_algoHandle != nullptr, {}, "dlopen ext fail, g_algoHandle null!");
+        getRegisterDecomposeExtensionFuncs = reinterpret_cast<LibFunctionGetRegisters>
+            (dlsym(g_algoHandle, "GetRegisterDecomposeExtensionFuncs"));
+    }
+    CHECK_AND_RETURN_RET_LOG(getRegisterDecomposeExtensionFuncs != nullptr, {},
         "dlsym GetRegisterDecomposeExtensionFuncs fail!");
 
-    auto dynamicExtensionsRegisterMapPtr = GetRegisterDecomposeExtensionFuncs();
+    auto dynamicExtensionsRegisterMapPtr = getRegisterDecomposeExtensionFuncs();
     CHECK_AND_RETURN_RET_LOG(dynamicExtensionsRegisterMapPtr != nullptr, {},
         "get dynamicMetadataGenExtensions fail!!");
     auto dynamicExtensionsRegisterMap = *dynamicExtensionsRegisterMapPtr;

@@ -169,7 +169,8 @@ private:
 
     static constexpr int32_t MAX_INSTANCE_NUM { 1024 };
     std::mutex instanceManagementMtx_;
-    std::mutex instanceCountMtx_;
+    // Protects usedInstance_ and all accesses to the dynamic library handle.
+    mutable std::mutex instanceCountMtx_;
     int32_t currentId_ { 0 };
     int32_t usedInstance_ { 0 };
     std::array<std::optional<InstanceVariableType>, MAX_INSTANCE_NUM> instanceList_ { std::nullopt };
